@@ -2,233 +2,245 @@ import os
 import cv2
 import re
 import numpy as np
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, Dict, List, Optional, Union
+from pathlib import Path
 
-
-def read_calib(calib_path: str) -> Tuple[np.ndarray, np.ndarray]:
+def read_calib(calib_path: Union[str, Path]) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Lit un fichier de calibration et extrait les matrices de transformation.
-
+    Lit un fichier de calibration et extrait les matrices de transformation avec une meilleure gestion des erreurs.
+    
     Args:
-        calib_path (str): Chemin vers le fichier de calibration texte
-
+        calib_path: Chemin vers le fichier de calibration texte
+        
     Returns:
         tuple: (P2, vtc_mat) où:
-            - P2: Matrice 3x4 de transformation des coordonnées caméra 3D vers pixels image 2D
-            - vtc_mat: Matrice 4x4 de transformation des coordonnées LiDAR 3D vers caméra 3D
+            - P2: Matrice 3x4 de projection caméra
+            - vtc_mat: Matrice 4x4 de transformation LiDAR vers caméra
+            
+    Raises:
+        FileNotFoundError: Si le fichier n'existe pas
+        ValueError: Si les matrices ne peuvent pas être lues
     """
+    if not os.path.exists(calib_path):
+        raise FileNotFoundError(f"Fichier de calibration {calib_path} introuvable")
+        
     P2 = None
     vtc_mat = None
     R0 = None
-
-    with open(calib_path) as f:
-        for line in f.readlines():
-            if line[:2] == "P2":
-                P2 = re.split(" ", line.strip())
-                P2 = np.array(P2[-12:], np.float32)
-                P2 = P2.reshape((3, 4))
-            if line[:14] == "Tr_velo_to_cam" or line[:11] == "Tr_velo_cam":
-                vtc_mat = re.split(" ", line.strip())
-                vtc_mat = np.array(vtc_mat[-12:], np.float32)
-                vtc_mat = vtc_mat.reshape((3, 4))
-                vtc_mat = np.concatenate([vtc_mat, [[0, 0, 0, 1]]])
-            if line[:7] == "R0_rect" or line[:6] == "R_rect":
-                R0 = re.split(" ", line.strip())
-                R0 = np.array(R0[-9:], np.float32)
-                R0 = R0.reshape((3, 3))
-                R0 = np.concatenate([R0, [[0], [0], [0]]], -1)
-                R0 = np.concatenate([R0, [[0, 0, 0, 1]]])
     
-    # Vérification que toutes les matrices nécessaires ont été trouvées
-    if P2 is None or vtc_mat is None or R0 is None:
-        raise ValueError(f"Impossible de lire toutes les matrices de calibration depuis {calib_path}")
+    try:
+        with open(calib_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                key, *values = re.split(r'\s+', line)
+                values = np.array(values, dtype=np.float32)
+                
+                if key == "P2":
+                    P2 = values[-12:].reshape(3, 4)
+                elif key in ["Tr_velo_to_cam", "Tr_velo_cam"]:
+                    vtc_mat = np.eye(4)
+                    vtc_mat[:3, :4] = values[-12:].reshape(3, 4)
+                elif key in ["R0_rect", "R_rect"]:
+                    R0 = np.eye(4)
+                    R0[:3, :3] = values[-9:].reshape(3, 3)
+    
+        if P2 is None or vtc_mat is None or R0 is None:
+            missing = []
+            if P2 is None: missing.append("P2")
+            if vtc_mat is None: missing.append("Tr_velo_to_cam")
+            if R0 is None: missing.append("R0_rect")
+            raise ValueError(f"Matrices manquantes dans {calib_path}: {', '.join(missing)}")
+            
+        vtc_mat = R0 @ vtc_mat  # Multiplication matricielle plus lisible avec @
+        return P2, vtc_mat
         
-    vtc_mat = np.matmul(R0, vtc_mat)
-    return (P2, vtc_mat)
+    except Exception as e:
+        raise ValueError(f"Erreur lors de la lecture de {calib_path}: {str(e)}")
 
 
-def read_velodyne(path: str, P: np.ndarray, vtc_mat: np.ndarray, IfReduce: bool = True, 
-                 image_dims: Tuple[int, int] = (374, 1241)) -> np.ndarray:
+def read_velodyne(path: Union[str, Path], 
+                 P: np.ndarray, 
+                 vtc_mat: np.ndarray, 
+                 IfReduce: bool = True, 
+                 image_dims: Tuple[int, int] = (374, 1241),
+                 min_distance: float = 0.1) -> np.ndarray:
     """
-    Lit les données LiDAR et les filtre pour ne garder que les points visibles dans l'image.
-
+    Version optimisée de la lecture LiDAR avec filtres supplémentaires.
+    
     Args:
-        path (str): Chemin vers le fichier binaire LiDAR
-        P (np.array): Matrice de projection caméra 3D vers 2D
-        vtc_mat (np.array): Matrice de transformation LiDAR vers caméra
-        IfReduce (bool): Si True, filtre les points hors image
-        image_dims (tuple): Dimensions (hauteur, largeur) de l'image cible
-
+        path: Chemin vers le fichier binaire LiDAR
+        P: Matrice de projection 3D->2D
+        vtc_mat: Matrice de transformation LiDAR->caméra
+        IfReduce: Filtre les points hors image si True
+        image_dims: Dimensions (h, w) de l'image
+        min_distance: Distance minimale pour filtrer les points proches
+        
     Returns:
-        np.array: Points LiDAR valides (coordonnées LiDAR)
-    """
-    max_row, max_col = image_dims  # hauteur (y), largeur (x)
-    
-    # Lecture du fichier binaire LiDAR
-    lidar = np.fromfile(path, dtype=np.float32).reshape((-1, 4))
-
-    if not IfReduce:
-        return lidar
-
-    # Filtre uniquement les points devant la caméra (x positif)
-    mask = lidar[:, 0] > 0
-    lidar = lidar[mask]
-    lidar_copy = np.copy(lidar)
-
-    # Transformation du point LiDAR vers coordonnées caméra homogènes
-    lidar_homogeneous = np.copy(lidar)
-    lidar_homogeneous[:, 3] = 1
-    
-    # Application de la transformation velo_to_cam
-    lidar_cam = np.matmul(lidar_homogeneous, vtc_mat.T)
-    
-    # Projection des points 3D sur l'image 2D
-    img_pts = np.matmul(lidar_cam, P.T)
-    
-    # Calcul de la transformation inverse pour remettre en coordonnées LiDAR
-    velo_tocam_inv = np.linalg.inv(vtc_mat)
-    normal = velo_tocam_inv[0:3, 0:4]
-    
-    # Retour aux coordonnées LiDAR 3D
-    lidar_proj = np.matmul(lidar_cam, normal.T)
-    lidar_copy[:, 0:3] = lidar_proj
-    
-    # Calcul des coordonnées pixel
-    x = img_pts[:, 0] / img_pts[:, 2]
-    y = img_pts[:, 1] / img_pts[:, 2]
-    
-    # Création d'un masque pour les points visibles dans l'image
-    mask = np.logical_and(
-        np.logical_and(x >= 0, x < max_col), 
-        np.logical_and(y >= 0, y < max_row)
-    )
-
-    return lidar_copy[mask]
-
-
-def cam_to_velo(cloud: np.ndarray, vtc_mat: np.ndarray) -> np.ndarray:
-    """
-    Convertit des points 3D de coordonnées caméra vers coordonnées LiDAR.
-
-    Args:
-        cloud (np.array): Points 3D en coordonnées caméra (shape Nx3)
-        vtc_mat (np.array): Matrice de transformation LiDAR vers caméra (4x4)
-
-    Returns:
-        np.array: Points 3D en coordonnées LiDAR (shape Nx3)
-    """
-    # Ajoute une colonne de 1 pour les coordonnées homogènes
-    mat = np.ones(shape=(cloud.shape[0], 4), dtype=np.float32)
-    mat[:, 0:3] = cloud[:, 0:3]
-    
-    # Calcule la transformation inverse (caméra vers LiDAR)
-    vtc_mat_inv = np.linalg.inv(vtc_mat)
-    normal = vtc_mat_inv[0:3, 0:4]  # Ne conserve que les 3 premières lignes
-    
-    # Applique la transformation
-    transformed_mat = np.matmul(mat, normal.T)
-    return transformed_mat
-
-
-def velo_to_cam(cloud: np.ndarray, vtc_mat: np.ndarray) -> np.ndarray:
-    """
-    Convertit des points 3D de coordonnées LiDAR vers coordonnées caméra.
-
-    Args:
-        cloud (np.array): Points 3D en coordonnées LiDAR (shape Nx3)
-        vtc_mat (np.array): Matrice de transformation LiDAR vers caméra (4x4)
-
-    Returns:
-        np.array: Points 3D en coordonnées caméra (shape Nx3)
-    """
-    # Ajoute une colonne de 1 pour les coordonnées homogènes
-    mat = np.ones(shape=(cloud.shape[0], 4), dtype=np.float32)
-    mat[:, 0:3] = cloud[:, 0:3]
-    
-    # Applique directement la transformation
-    transformed_mat = np.matmul(mat, vtc_mat.T)
-    transformed_mat = transformed_mat[:, :3]  # Supprime la composante homogène
-    return transformed_mat
-
-
-def read_image(path: str) -> np.ndarray:
-    """
-    Lit une image à partir d'un fichier.
-
-    Args:
-        path (str): Chemin vers l'image
-
-    Returns:
-        np.array: Matrice de l'image
+        Points LiDAR filtrés (Nx4)
     """
     try:
-        im = cv2.imdecode(np.fromfile(path, dtype=np.uint8), -1)
-        if im is None:
-            # Essayer la méthode standard si imdecode échoue
-            im = cv2.imread(path)
-        return im
+        # Lecture plus robuste des données LiDAR
+        points = np.fromfile(path, dtype=np.float32).reshape(-1, 4)
+        
+        if not IfReduce:
+            return points
+            
+        # Filtrage des points derrière la caméra ou trop proches
+        front_mask = points[:, 0] > min_distance
+        points = points[front_mask]
+        
+        if points.size == 0:
+            return np.empty((0, 4), dtype=np.float32)
+            
+        # Transformation vers coordonnées caméra
+        hom_points = np.column_stack([points[:, :3], np.ones(points.shape[0])])
+        cam_points = hom_points @ vtc_mat.T
+        
+        # Projection sur l'image
+        img_points = cam_points @ P.T
+        img_points[:, :2] /= img_points[:, 2:3]  # Normalisation
+        
+        # Masque des points visibles
+        h, w = image_dims
+        in_image_mask = ((img_points[:, 0] >= 0) & (img_points[:, 0] < w) & \
+                       ((img_points[:, 1] >= 0) & (img_points[:, 1] < h) & \
+                       (img_points[:, 2] > 0)  # Devant la caméra
+                       
+        return points[in_image_mask]
+        
     except Exception as e:
-        raise IOError(f"Impossible de lire l'image {path}: {e}")
+        raise IOError(f"Erreur lors du traitement de {path}: {str(e)}")
 
 
-def read_detection_label(path: str) -> Tuple[np.ndarray, np.ndarray]:
+def read_image(path: Union[str, Path], 
+              mode: str = 'rgb') -> np.ndarray:
     """
-    Lit un fichier d'étiquettes de détection.
-
+    Lecture d'image avec options supplémentaires.
+    
     Args:
-        path (str): Chemin vers le fichier d'étiquettes
-
+        path: Chemin vers l'image
+        mode: 'rgb' ou 'bgr' pour l'ordre des canaux
+        
     Returns:
-        tuple: (boxes, names) où:
-            - boxes: Tableau des coordonnées des boîtes englobantes
-            - names: Tableau des noms des étiquettes
+        Image en format numpy array
+    """
+    try:
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError(f"Impossible de lire l'image {path}")
+            
+        if mode.lower() == 'rgb':
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
+    except Exception as e:
+        raise IOError(f"Erreur lors de la lecture de {path}: {str(e)}")
+
+
+def read_detection_label(path: Union[str, Path], 
+                        filter_classes: Optional[List[str]] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Lecture des labels avec filtrage des classes.
+    
+    Args:
+        path: Chemin vers le fichier label
+        filter_classes: Liste des classes à conserver (None pour toutes)
+        
+    Returns:
+        (boxes, names) où boxes sont les annotations 3D
     """
     boxes = []
     names = []
+    
+    try:
+        with open(path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                    
+                cls_name = parts[0]
+                if cls_name == "DontCare":
+                    continue
+                    
+                if filter_classes is None or cls_name in filter_classes:
+                    boxes.append(np.array(parts[-7:], dtype=np.float32))
+                    names.append(cls_name)
+                    
+        return np.array(boxes) if boxes else np.empty((0, 7), dtype=np.float32), \
+               np.array(names) if names else np.empty(0, dtype=object)
+               
+    except Exception as e:
+        raise IOError(f"Erreur lors de la lecture de {path}: {str(e)}")
 
-    with open(path) as f:
-        for line in f.readlines():
-            line = line.split()
-            this_name = line[0]
-            if this_name != "DontCare":
-                line = np.array(line[-7:], np.float32)
-                boxes.append(line)
-                names.append(this_name)
 
-    return np.array(boxes), np.array(names)
-
-
-def read_tracking_label(path: str) -> Tuple[Dict[int, List], Dict[int, List]]:
+# Fonctions de conversion optimisées
+def transform_points(points: np.ndarray, 
+                    transformation: np.ndarray,
+                    direction: str = 'forward') -> np.ndarray:
     """
-    Lit un fichier d'étiquettes de suivi (tracking).
-
+    Transformation générique des points 3D.
+    
     Args:
-        path (str): Chemin vers le fichier d'étiquettes
-
+        points: Points 3D (Nx3 ou Nx4)
+        transformation: Matrice de transformation 4x4
+        direction: 'forward' ou 'inverse'
+        
     Returns:
-        tuple: (frame_dict, names_dict) où:
-            - frame_dict: Dictionnaire des objets par frame
-            - names_dict: Dictionnaire des noms d'objets par frame
+        Points transformés
     """
-    frame_dict = {}
-    names_dict = {}
+    if points.size == 0:
+        return points.copy()
+        
+    if points.shape[1] == 3:
+        points = np.column_stack([points, np.ones(points.shape[0])])
+        
+    if direction == 'inverse':
+        transformation = np.linalg.inv(transformation)
+        
+    return (points @ transformation.T)[:, :3]
 
-    with open(path) as f:
-        for line in f.readlines():
-            line = line.split()
-            this_name = line[2]
-            frame_id = int(line[0])
-            ob_id = int(line[1])
 
-            if this_name != "DontCare":
-                line = np.array(line[10:17], np.float32).tolist()
-                line.append(ob_id)
+# Alias pour compatibilité
+cam_to_velo = lambda cloud, vtc_mat: transform_points(cloud, vtc_mat, 'inverse')
+velo_to_cam = lambda cloud, vtc_mat: transform_points(cloud, vtc_mat, 'forward')
 
-                if frame_id in frame_dict:
-                    frame_dict[frame_id].append(line)
-                    names_dict[frame_id].append(this_name)
-                else:
-                    frame_dict[frame_id] = [line]
-                    names_dict[frame_id] = [this_name]
 
-    return frame_dict, names_dict
+def visualize_lidar_on_image(points: np.ndarray, 
+                           image: np.ndarray,
+                           P: np.ndarray,
+                           vtc_mat: np.ndarray,
+                           point_size: int = 2,
+                           color_map: str = 'jet') -> np.ndarray:
+    """
+    Visualisation des points LiDAR projetés sur l'image.
+    """
+    if points.size == 0:
+        return image.copy()
+        
+    # Transformation des points
+    hom_points = np.column_stack([points[:, :3], np.ones(points.shape[0])])
+    cam_points = hom_points @ vtc_mat.T
+    img_points = cam_points @ P.T
+    img_points[:, :2] /= img_points[:, 2:3]
+    
+    # Création d'une colormap basée sur l'intensité ou la distance
+    if color_map == 'intensity' and points.shape[1] >= 4:
+        colors = points[:, 3]
+    else:
+        distances = np.linalg.norm(points[:, :3], axis=1)
+        colors = distances
+        
+    # Normalisation des couleurs
+    colors = (colors - colors.min()) / (colors.max() - colors.min() + 1e-6)
+    colors = plt.get_cmap(color_map)(colors)[:, :3] * 255
+    
+    # Dessin des points
+    img_viz = image.copy()
+    for (u, v), color in zip(img_points[:, :2].astype(int), colors):
+        if 0 <= u < image.shape[1] and 0 <= v < image.shape[0]:
+            cv2.circle(img_viz, (u, v), point_size, color.tolist(), -1)
+            
+    return img_viz
