@@ -105,9 +105,9 @@ def read_velodyne(path: Union[str, Path],
         
         # Masque des points visibles
         h, w = image_dims
-        in_image_mask = ((img_points[:, 0] >= 0) & (img_points[:, 0] < w) & \
-                       ((img_points[:, 1] >= 0) & (img_points[:, 1] < h) & \
-                       (img_points[:, 2] > 0)  # Devant la caméra
+        in_image_mask = ((img_points[:, 0] >= 0) & (img_points[:, 0] < w) &
+                 (img_points[:, 1] >= 0) & (img_points[:, 1] < h) &
+                 (img_points[:, 2] > 0))  # Devant la caméra
                        
         return points[in_image_mask]
         
